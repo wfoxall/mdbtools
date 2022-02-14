@@ -26,6 +26,14 @@
 static char *escapes(char *s);
 static void format_value(FILE *outfile, char *value, size_t length, int quote_text, int col_type, char *escape_char, char *quote_char, int bin_mode, int export_flags, char *backend_name);
 
+static void concatString(char *dst, size_t *length, char *src) {
+	if(strlen(dst) + strlen(src) + 1 > *length){
+		*length *= 2;
+		dst = realloc(dst, *length);
+	}
+	strcat(dst,src);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -61,6 +69,8 @@ main(int argc, char **argv)
 	char *table_name = NULL;
 	int print_mdbver = 0;
 	char *on_conflict_text = NULL;
+	size_t *on_conflict_text_len = malloc(sizeof(size_t));
+	char *p_key;
 
 	GOptionEntry entries[] = {
 		{"no-header", 'H', G_OPTION_FLAG_REVERSE, G_OPTION_ARG_NONE, &header_row, "Suppress header row.", NULL},
@@ -71,6 +81,7 @@ main(int argc, char **argv)
 		{"escape", 'X', 0, G_OPTION_ARG_STRING, &escape_char, "Use <char> to escape quoted characters within a field. Default is doubling.", "format"},
 		{"escape-invisible", 'e', 0, G_OPTION_ARG_NONE, &escape_cr_lf, "Use C-style escaping for return (\\r), tab (\\t), line-feed (\\n), and back-slash (\\\\) characters. Default is to leave as they are.", NULL},
 		{"insert", 'I', 0, G_OPTION_ARG_STRING, &insert_dialect, "INSERT statements (instead of CSV)", "backend"},
+		{"primary-key", 'P', 0, G_OPTION_ARG_STRING, &p_key, "Manually specifify a single column as primary key (Only used for generating ON CONFLICT statements with postgres backend)", "string"},
 		{"namespace", 'N', 0, G_OPTION_ARG_STRING, &namespace, "Prefix identifiers with namespace", "namespace"},
 		{"batch-size", 'S', 0, G_OPTION_ARG_INT, &batch_size, "Size of insert batches on supported platforms.", "int"},
 		{"date-format", 'D', 0, G_OPTION_ARG_STRING, &shortdate_fmt, "Set the date format (see strftime(3) for details)", "format"},
@@ -222,56 +233,73 @@ main(int argc, char **argv)
 
 	// ON CONFLICT statements can be constructed once and reused for each batch
 	if(mdb->default_backend->capabilities & MDB_SHEXP_ON_CONFLICT){
-		on_conflict_text = malloc(500);
+		*on_conflict_text_len = 1024;
+		on_conflict_text = malloc(*on_conflict_text_len);
+		strcat(on_conflict_text,"");
 		// Only supporting postgres for now...
 		if(!strcmp(mdb->backend_name,"postgres")){
-			MdbIndex *idx;
-			int pri_key_idx_num = -1;
-			for (i = 0; i < table->num_idxs; i++)
-			{
-				idx = g_ptr_array_index(table->indices, i);
-				if (idx->index_type == 1)
-				{
-					pri_key_idx_num = i;
-					strcat(on_conflict_text, "\nON CONFLICT (");
-					char *quoted_name;
-					for (j = 0; j < idx->num_keys; j++) {
-						if(j>0) strcat(on_conflict_text, ",");
-						col=g_ptr_array_index(table->columns,idx->key_col_num[j]-1);
-						quoted_name = mdb->default_backend->quote_schema_name(NULL, col->name);
-						quoted_name = mdb_normalise_and_replace(mdb, &quoted_name);
-						strcat(on_conflict_text, quoted_name);
-						free(quoted_name);
-					}
-					strcat(on_conflict_text, ") DO UPDATE");
-				}
-			}
-			if (pri_key_idx_num != -1) {
-				char *quoted_name;
+			char *quoted_name = malloc(512);
+			if(p_key){
+				p_key = mdb->default_backend->quote_schema_name(NULL, p_key);
+				p_key = mdb_normalise_and_replace(mdb, &p_key);
+				concatString(on_conflict_text,on_conflict_text_len, "\nON CONFLICT (");
+				concatString(on_conflict_text,on_conflict_text_len, p_key);
+				concatString(on_conflict_text,on_conflict_text_len, ") DO UPDATE");
 				for (i = 0; i < table->num_cols; i++) {
-					int is_in_pri_key = 0;
-					idx = g_ptr_array_index(table->indices, pri_key_idx_num);
-					for (j = 0; j < idx->num_keys; j++) {
-						if(g_ptr_array_index(table->columns, i) == g_ptr_array_index(table->columns,idx->key_col_num[j]-1))
-						{
-							is_in_pri_key = 1;
-							break;
+					col = g_ptr_array_index(table->columns, i);
+					quoted_name = mdb->default_backend->quote_schema_name(NULL, col->name);
+					quoted_name = mdb_normalise_and_replace(mdb, &quoted_name);
+					if(!strcmp(p_key,quoted_name)) continue;
+					concatString(on_conflict_text,on_conflict_text_len, "\nSET ");
+					concatString(on_conflict_text,on_conflict_text_len, quoted_name);
+					concatString(on_conflict_text,on_conflict_text_len, " = EXCLUDED.");
+					concatString(on_conflict_text,on_conflict_text_len, quoted_name);
+				}
+			}else{
+				MdbIndex *idx = malloc(sizeof(MdbIndex));
+				int pri_key_idx_num = -1;
+				for (i = 0; i < table->num_idxs; i++)
+				{
+					idx = g_ptr_array_index(table->indices, i);
+					if (idx->index_type == 1)
+					{
+						pri_key_idx_num = i;
+						concatString(on_conflict_text,on_conflict_text_len, "\nON CONFLICT (");
+						for (j = 0; j < idx->num_keys; j++) {
+							if(j>0) concatString(on_conflict_text,on_conflict_text_len, ",");
+							col=g_ptr_array_index(table->columns,idx->key_col_num[j]-1);
+							quoted_name = mdb->default_backend->quote_schema_name(NULL, col->name);
+							quoted_name = mdb_normalise_and_replace(mdb, &quoted_name);
+							concatString(on_conflict_text,on_conflict_text_len, quoted_name);
+						}
+						concatString(on_conflict_text,on_conflict_text_len, ") DO UPDATE");
+					}
+				}
+				if (pri_key_idx_num != -1) {
+					for (i = 0; i < table->num_cols; i++) {
+						int is_in_pri_key = 0;
+						idx = g_ptr_array_index(table->indices, pri_key_idx_num);
+						for (j = 0; j < idx->num_keys; j++) {
+							if(g_ptr_array_index(table->columns, i) == g_ptr_array_index(table->columns,idx->key_col_num[j]-1))
+							{
+								is_in_pri_key = 1;
+								break;
+							}
+						}
+						if(!is_in_pri_key){
+							col = g_ptr_array_index(table->columns, i);
+							quoted_name = mdb->default_backend->quote_schema_name(NULL, col->name);
+							quoted_name = mdb_normalise_and_replace(mdb, &quoted_name);
+							concatString(on_conflict_text,on_conflict_text_len, "\nSET ");
+							concatString(on_conflict_text,on_conflict_text_len, quoted_name);
+							concatString(on_conflict_text,on_conflict_text_len, " = EXCLUDED.");
+							concatString(on_conflict_text,on_conflict_text_len, quoted_name);
 						}
 					}
-					if(!is_in_pri_key){
-						col = g_ptr_array_index(table->columns, i);
-						quoted_name = mdb->default_backend->quote_schema_name(NULL, col->name);
-						quoted_name = mdb_normalise_and_replace(mdb, &quoted_name);
-						strcat(on_conflict_text, "\nSET ");
-						strcat(on_conflict_text, quoted_name);
-						strcat(on_conflict_text, " = EXCLUDED.");
-						strcat(on_conflict_text, quoted_name);
-						free(quoted_name);
-					}
+				}else{
+					fprintf(stderr, "Warning: No primary key found! ON CONFLICT statements not in use.\n");
 				}
 			}
-			if(!idx)
-			free(idx);
 		}
 	}
 
@@ -331,7 +359,7 @@ main(int argc, char **argv)
 				// WJF: At this point, if backend supports it, we can add an ON CONFLICT statement
 				if(mdb->default_backend->capabilities & MDB_SHEXP_ON_CONFLICT){
 					// Only supporting postgres for now...
-					if(!strcmp(mdb->backend_name,"postgres")){
+					if(!strcmp(mdb->backend_name,"postgres") && on_conflict_text != NULL){
 						fputs(on_conflict_text, outfile);
 					}
 				}
