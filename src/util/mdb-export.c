@@ -30,6 +30,7 @@ int
 main(int argc, char **argv)
 {
 	unsigned int i;
+	unsigned int j;
 	MdbHandle *mdb;
 	MdbTableDef *table;
 	MdbColumn *col;
@@ -59,6 +60,7 @@ main(int argc, char **argv)
 	char *locale = NULL;
 	char *table_name = NULL;
 	int print_mdbver = 0;
+	char *on_conflict_text = NULL;
 
 	GOptionEntry entries[] = {
 		{"no-header", 'H', G_OPTION_FLAG_REVERSE, G_OPTION_ARG_NONE, &header_row, "Suppress header row.", NULL},
@@ -194,6 +196,7 @@ main(int argc, char **argv)
 
 	/* read table */
 	mdb_read_columns(table);
+	mdb_read_indices(table);
 	mdb_rewind_table(table);
 
 	bound_values = g_malloc(table->num_cols * sizeof(char *));
@@ -215,6 +218,61 @@ main(int argc, char **argv)
 			fputs(col->name, outfile);
 		}
 		fputs(row_delimiter, outfile);
+	}
+
+	// ON CONFLICT statements can be constructed once and reused for each batch
+	if(mdb->default_backend->capabilities & MDB_SHEXP_ON_CONFLICT){
+		on_conflict_text = malloc(500);
+		// Only supporting postgres for now...
+		if(!strcmp(mdb->backend_name,"postgres")){
+			MdbIndex *idx;
+			int pri_key_idx_num = -1;
+			for (i = 0; i < table->num_idxs; i++)
+			{
+				idx = g_ptr_array_index(table->indices, i);
+				if (idx->index_type == 1)
+				{
+					pri_key_idx_num = i;
+					strcat(on_conflict_text, "\nON CONFLICT (");
+					char *quoted_name;
+					for (j = 0; j < idx->num_keys; j++) {
+						if(j>0) strcat(on_conflict_text, ",");
+						col=g_ptr_array_index(table->columns,idx->key_col_num[j]-1);
+						quoted_name = mdb->default_backend->quote_schema_name(NULL, col->name);
+						quoted_name = mdb_normalise_and_replace(mdb, &quoted_name);
+						strcat(on_conflict_text, quoted_name);
+						free(quoted_name);
+					}
+					strcat(on_conflict_text, ") DO UPDATE");
+				}
+			}
+			if (pri_key_idx_num != -1) {
+				char *quoted_name;
+				for (i = 0; i < table->num_cols; i++) {
+					int is_in_pri_key = 0;
+					idx = g_ptr_array_index(table->indices, pri_key_idx_num);
+					for (j = 0; j < idx->num_keys; j++) {
+						if(g_ptr_array_index(table->columns, i) == g_ptr_array_index(table->columns,idx->key_col_num[j]-1))
+						{
+							is_in_pri_key = 1;
+							break;
+						}
+					}
+					if(!is_in_pri_key){
+						col = g_ptr_array_index(table->columns, i);
+						quoted_name = mdb->default_backend->quote_schema_name(NULL, col->name);
+						quoted_name = mdb_normalise_and_replace(mdb, &quoted_name);
+						strcat(on_conflict_text, "\nSET ");
+						strcat(on_conflict_text, quoted_name);
+						strcat(on_conflict_text, " = EXCLUDED.");
+						strcat(on_conflict_text, quoted_name);
+						free(quoted_name);
+					}
+				}
+			}
+			if(!idx)
+			free(idx);
+		}
 	}
 
 	// TODO refactor this into functions
@@ -270,6 +328,13 @@ main(int argc, char **argv)
 			}
 			fputs(")", outfile);
 			if (counter % batch_size == batch_size - 1) {
+				// WJF: At this point, if backend supports it, we can add an ON CONFLICT statement
+				if(mdb->default_backend->capabilities & MDB_SHEXP_ON_CONFLICT){
+					// Only supporting postgres for now...
+					if(!strcmp(mdb->backend_name,"postgres")){
+						fputs(on_conflict_text, outfile);
+					}
+				}
 				fputs(";", outfile);
 				fputs(row_delimiter, outfile);
 			}
